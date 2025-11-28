@@ -638,7 +638,7 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
     // Add Basic cluster for device identification
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+        .power_source = 0x01,  // Mains (single phase) - this is a wall-powered router device. 0x03=battery, 0x04=dc
     };
     esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
     ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, MANUFACTURER_NAME));
