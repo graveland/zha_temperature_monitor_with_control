@@ -6,6 +6,8 @@ This wraps the ESP32 firmware binary in Zigbee OTA format.
 Requires: pip install zigpy
 """
 
+import hashlib
+import json
 import os
 import sys
 
@@ -77,17 +79,41 @@ def create_zigbee_ota_file(input_bin, output_ota, file_version=DEFAULT_FILE_VERS
         f.write(ota_data)
 
     print(f"✓ Created OTA image: {output_ota}")
+
+    # Calculate SHA512 hash
+    with open(output_ota, 'rb') as f:
+        sha512_hash = hashlib.sha512(f.read()).hexdigest()
+
+    # Generate index.json entry for zigbee2mqtt
+    index_entry = {
+        "fileName": os.path.basename(output_ota),
+        "fileVersion": file_version,
+        "fileSize": image.header.image_size,
+        "url": f"./{os.path.basename(output_ota)}",  # Relative path for local files
+        "imageType": IMAGE_TYPE,
+        "manufacturerCode": MANUFACTURER_CODE,
+        "sha512": sha512_hash,
+        "otaHeaderString": str(image.header.header_string)
+    }
+
+    print(f"\nZigbee2MQTT index.json entry:")
+    print(json.dumps(index_entry, indent=2))
+
     print(f"\nTo use this OTA image:")
-    print(f"  1. Copy to your zigbee2mqtt data/ota/ directory")
-    print(f"  2. Restart Zigbee2MQTT")
-    print(f"  3. Trigger OTA update via frontend or MQTT")
+    print(f"  1. Copy {output_ota} to your zigbee2mqtt data/ota/ directory")
+    print(f"  2. Create or update data/ota/index.json with the entry above")
+    print(f"  3. In configuration.yaml, set:")
+    print(f"     ota:")
+    print(f"       zigbee_ota_override_index_location: index.json")
+    print(f"  4. Restart Zigbee2MQTT")
+    print(f"  5. Trigger OTA update via frontend or MQTT")
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python3 create_ota_image.py <input_binary> [output_ota] [file_version]")
         print("\nExample:")
-        print("  python3 create_ota_image.py build/esp_zha_freezer_mon.bin")
-        print("  python3 create_ota_image.py build/esp_zha_freezer_mon.bin output.ota 3")
+        print("  python3 create_ota_image.py build/zha_temperature_monitor.bin")
+        print("  python3 create_ota_image.py build/zha_temperature_monitor.bin output.ota 2")
         sys.exit(1)
 
     input_bin = sys.argv[1]
