@@ -12,16 +12,23 @@
 #include "freertos/task.h"
 #include "ha/esp_zigbee_ha_standard.h"
 
+#include "driver/gpio.h"
+#include "led_strip.h"
+
 #include "temp_sensor.h"
 #include "nvs_functions.h"
 
 
 static const char *TAG = "ESP_ZB_TEMP_SENSOR";
+static led_strip_handle_t led_strip = NULL;
 uint8_t read_failures = 0;
 
 uint8_t ds18b20_device_num = 0;
 ds18b20_device_handle_t ds18b20s[HA_ESP_NUM_T_SENSORS];
 uint8_t ep_to_ds[HA_ESP_NUM_T_SENSORS]; // Use 0xff to indicate no link
+
+// Forward declarations
+static void led_identify_blink(uint16_t identify_time);
 
 // Track the current state of the controlled switch
 static bool switch_state = false;
@@ -43,8 +50,22 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 {
     esp_err_t ret = ESP_OK;
 
+    ESP_LOGI(TAG, "Cluster attr write: cluster=0x%x, attr=0x%x",
+             message->info.cluster, message->attribute.id);
+
+    // Handle Identify cluster
+    if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY) {
+        // Handle identify command - attribute 0x0 is identify_time
+        if (message->attribute.id == ESP_ZB_ZCL_ATTR_IDENTIFY_IDENTIFY_TIME_ID) {
+            uint16_t identify_time = *(uint16_t *)message->attribute.data.value;
+            ESP_LOGI(TAG, "Identify command received, time=%d seconds", identify_time);
+            if (identify_time > 0) {
+                led_identify_blink(identify_time);
+            }
+        }
+    }
     // Handle writes to Thermostat cluster for temperature thresholds
-    if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT &&
+    else if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT &&
         message->info.dst_endpoint >= HA_ESP_TEMP_START_ENDPOINT &&
         message->info.dst_endpoint < (HA_ESP_TEMP_START_ENDPOINT + HA_ESP_NUM_T_SENSORS))
     {
@@ -95,6 +116,16 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     }
 
     return ret;
+}
+
+static esp_err_t zb_identify_handler(esp_zb_zcl_identify_effect_message_t *message) {
+    ESP_LOGI(TAG, "Identify effect command received: effect_id=%d, effect_variant=%d",
+             message->effect_id, message->effect_variant);
+
+    // Blink LED for identify - use 5 seconds as default
+    led_identify_blink(5);
+
+    return ESP_OK;
 }
 
 // OTA partition and handle (must be static for persistence across callbacks)
@@ -240,6 +271,52 @@ static esp_err_t zb_ota_upgrade_query_image_resp_handler(esp_zb_zcl_ota_upgrade_
         ESP_LOGI(TAG, "No OTA image available");
         return ESP_FAIL;
     }
+}
+
+static void init_rgb_led(void) {
+    // Configure LED strip (WS2812 or similar RGB LED on GPIO8)
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = RGB_LED_GPIO,
+        .max_leds = 1, // Single RGB LED
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+        .flags.with_dma = false,
+    };
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+
+    // Turn off LED initially
+    led_strip_clear(led_strip);
+    ESP_LOGI(TAG, "RGB LED initialized on GPIO %d", RGB_LED_GPIO);
+}
+
+static void set_led_color(uint8_t red, uint8_t green, uint8_t blue) {
+    if (led_strip) {
+        led_strip_set_pixel(led_strip, 0, red, green, blue);
+        led_strip_refresh(led_strip);
+    }
+}
+
+static void led_identify_blink(uint16_t identify_time) {
+    // Blink BLUE for identify command
+    ESP_LOGI(TAG, "Identify requested for %d seconds - blinking BLUE", identify_time);
+
+    uint16_t blink_count = identify_time * 2; // Blink twice per second
+    for (uint16_t i = 0; i < blink_count; i++) {
+        set_led_color(0, 0, 255); // Blue
+        vTaskDelay(pdMS_TO_TICKS(250));
+        set_led_color(0, 0, 0); // Off
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    // Turn off LED after identify
+    set_led_color(0, 0, 0);
 }
 
 static void start_temp_timer()
@@ -414,6 +491,9 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 
 static esp_err_t deferred_driver_init(void)
 {
+    ESP_LOGI(TAG, "Initializing RGB LED");
+    init_rgb_led();
+
     // Load temperature thresholds from NVS or use defaults
     float loaded_on = 0, loaded_off = 0;
     if (get_temp_thresholds(&loaded_on, &loaded_off) == ESP_OK)
@@ -549,12 +629,15 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
     case ESP_ZB_CORE_OTA_UPGRADE_QUERY_IMAGE_RESP_CB_ID:
         ret = zb_ota_upgrade_query_image_resp_handler(*(esp_zb_zcl_ota_upgrade_query_image_resp_message_t *)message);
         break;
+    case ESP_ZB_CORE_IDENTIFY_EFFECT_CB_ID:
+        ret = zb_identify_handler((esp_zb_zcl_identify_effect_message_t *)message);
+        break;
     case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
-        {
-            esp_zb_zcl_cmd_default_resp_message_t *default_resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
-            ESP_LOGI(TAG, "Default response: status=%d, cluster=0x%04x, cmd=0x%02x",
-                     default_resp->info.status, default_resp->info.cluster, default_resp->resp_to_cmd);
-        }
+        // Default response from coordinator - normal Zigbee communication
+        ESP_LOGD(TAG, "Received default response");
+        break;
+    case ESP_ZB_CORE_CMD_GREEN_POWER_RECV_CB_ID:
+        // Green power cluster - not used, ignore silently
         break;
     default:
         ESP_LOGW(TAG, "Unhandled action callback: %d (0x%04x)", callback_id, callback_id);
@@ -645,6 +728,13 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
     ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, MODEL_IDENTIFIER));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
+    // Add Identify cluster for device identification (LED blink)
+    esp_zb_identify_cluster_cfg_t identify_cfg = {
+        .identify_time = 0,
+    };
+    esp_zb_attribute_list_t *identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
     // Add Thermostat cluster for temperature threshold configuration
     // Initialize the global attribute values (in centidegrees)
     zb_on_threshold_attr = zb_temperature_to_s16(temp_control_on_threshold);
@@ -664,6 +754,24 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
 
     // Note: We use Thermostat cluster's local_temperature for temperature reporting
     // instead of a separate Temperature Measurement cluster
+
+    // Add Power Configuration cluster to report mains power
+    esp_zb_power_config_cluster_cfg_t power_cfg = {
+        .main_voltage = 0xffff, // Unknown mains voltage
+        .main_alarm_mask = 0x00, // No alarms
+    };
+    esp_zb_attribute_list_t *power_cluster = esp_zb_power_config_cluster_create(&power_cfg);
+
+    // Set battery percentage to 200 (0xC8) which indicates "AC/Mains powered" per Zigbee spec
+    // This prevents battery low warnings in Zigbee2MQTT
+    // Using raw attribute ID 0x0021 (BatteryPercentageRemaining)
+    uint8_t battery_percentage = 200;
+    ESP_ERROR_CHECK(esp_zb_power_config_cluster_add_attr(
+        power_cluster, 0x0021,
+        &battery_percentage));
+
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_power_config_cluster(
+        cluster_list, power_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     // Add On/Off client cluster to control other devices
     esp_zb_on_off_cluster_cfg_t on_off_cfg = {
