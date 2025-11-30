@@ -345,7 +345,7 @@ void report_temp_attr(uint8_t ep)
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
     esp_zb_lock_release();
-    ESP_EARLY_LOGI(TAG, "Send 'report attributes' command");
+    ESP_EARLY_LOGD(TAG, "Send 'report attributes' command");
 }
 
 void esp_app_temp_sensor_handler(float temperature, uint8_t endpoint)
@@ -424,7 +424,6 @@ void read_temps(float *temp_results)
     vTaskDelay(pdMS_TO_TICKS(200));
     for (uint8_t i = 0; i < ds18b20_device_num; i++)
     {
-        ESP_LOGI(TAG, "Setting Temp Conv");
         esp_err_t err = ds18b20_trigger_temperature_conversion(ds18b20s[i]);
         if (err == ESP_OK)
         {
@@ -460,7 +459,7 @@ static void temp_timer_callback(void *arg)
     for (int i = 0; i < HA_ESP_NUM_T_SENSORS; i++)
     {
         uint8_t dsb_index = ep_to_ds[i];
-        ESP_LOGI(TAG, "EP: %d, dsb_index: %d", i, dsb_index);
+        ESP_LOGD(TAG, "EP: %d, dsb_index: %d", i, dsb_index);
 
         if (dsb_index == 0xff)
         {
