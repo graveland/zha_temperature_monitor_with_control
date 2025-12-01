@@ -186,6 +186,17 @@ static esp_err_t zb_ota_upgrade_status_handler(esp_zb_zcl_ota_upgrade_value_mess
         switch (message.upgrade_status) {
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
             ESP_LOGI(TAG, "-- OTA upgrade start");
+
+            // Clean up any previous incomplete OTA session
+            if (s_ota_handle != 0) {
+                ESP_LOGW(TAG, "Cleaning up previous OTA handle");
+                esp_ota_end(s_ota_handle);
+                s_ota_handle = 0;
+            }
+            offset = 0;
+            total_size = 0;
+            s_tagid_received = false;
+
             start_time = esp_timer_get_time();
             s_ota_partition = esp_ota_get_next_update_partition(NULL);
             if (!s_ota_partition) {
