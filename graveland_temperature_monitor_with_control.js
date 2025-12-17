@@ -8,6 +8,18 @@ const ea = exposes.access;
 const fs = require('fs');
 const path = require('path');
 
+const fzLocal = {
+    reset_count: {
+        cluster: 'haDiagnostic',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.numberOfResets !== undefined) {
+                return {reset_count: msg.data.numberOfResets};
+            }
+        },
+    },
+};
+
 const definition = {
     zigbeeModel: ['Temperature Monitor'],
     model: 'Temperature Monitor',
@@ -22,14 +34,24 @@ const definition = {
             .withSetpoint('occupied_heating_setpoint', -20, 80, 0.5)
             .withSetpoint('occupied_cooling_setpoint', -20, 80, 0.5)
             .withLocalTemperature(),
+        // Reboot switch on endpoint 10
+        e.switch_().withEndpoint('reboot'),
+        // Reset count from diagnostics cluster
+        e.numeric('reset_count', ea.STATE).withDescription('Number of device resets'),
     ],
     fromZigbee: [
         fz.thermostat,
+        fz.on_off,
+        fzLocal.reset_count,
     ],
     toZigbee: [
         tz.thermostat_occupied_heating_setpoint,
         tz.thermostat_occupied_cooling_setpoint,
+        tz.on_off,
     ],
+    endpoint: (device) => {
+        return {reboot: 10};
+    },
     ota: {
         isUpdateAvailable: async (device, logger, data = null) => {
             // Read custom index.json directly
@@ -109,6 +131,16 @@ const definition = {
 
         // Read thermostat setpoints
         await endpoint.read('hvacThermostat', ['localTemp', 'occupiedHeatingSetpoint', 'occupiedCoolingSetpoint']);
+
+        // Configure reboot switch endpoint
+        const rebootEndpoint = device.getEndpoint(10);
+        if (rebootEndpoint) {
+            await rebootEndpoint.bind('genOnOff', coordinatorEndpoint);
+            await rebootEndpoint.read('genOnOff', ['onOff']);
+        }
+
+        // Read reset count from diagnostics cluster
+        await endpoint.read('haDiagnostic', ['numberOfResets']);
     },
 };
 

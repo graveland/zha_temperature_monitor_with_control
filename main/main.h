@@ -20,6 +20,14 @@
 #define TEMP_CONTROL_ON_THRESHOLD       (2.0)   /* Turn ON when temperature drops below this */
 #define TEMP_CONTROL_OFF_THRESHOLD      (3.0)   /* Turn OFF when temperature rises above this */
 
+/* Temperature watchdog - reboot if temperature hasn't changed for this duration */
+#define TEMP_WATCHDOG_TIMEOUT_MINUTES   30
+#define TEMP_WATCHDOG_TIMEOUT_US        (TEMP_WATCHDOG_TIMEOUT_MINUTES * 60 * 1000000LL)
+#define TEMP_CHANGE_THRESHOLD           0.01f   /* Minimum change to reset watchdog */
+
+/* Reboot switch endpoint */
+#define HA_ESP_REBOOT_ENDPOINT          10      /* Separate endpoint for reboot switch */
+
 /* We use the Thermostat cluster for temperature thresholds:
  * - occupied_heating_setpoint (0x0012) = ON threshold (turn heater ON below this)
  * - occupied_cooling_setpoint (0x0011) = OFF threshold (turn heater OFF above this)
@@ -35,7 +43,7 @@
 /* OTA Upgrade configuration */
 #define OTA_UPGRADE_MANUFACTURER        0x1234                  /* Manufacturer code (must match OTA image) */
 #define OTA_UPGRADE_IMAGE_TYPE          0x5678                  /* Image type (must match OTA image) */
-#define OTA_UPGRADE_FILE_VERSION        0x00000007              /* Current firmware version */
+#define OTA_UPGRADE_FILE_VERSION        0x00000008              /* Current firmware version */
 #define OTA_UPGRADE_HW_VERSION          0x0001                  /* Hardware version */
 #define OTA_UPGRADE_MAX_DATA_SIZE       64                      /* OTA image block size */
 
