@@ -33,10 +33,11 @@ static void led_identify_blink(uint16_t identify_time);
 // Track the current state of the controlled switch
 static bool switch_state = false;
 
-// Temperature watchdog - detect stuck sensor readings
+// Temperature watchdog - detect stuck/missing sensor readings
+static float last_fed_temp = DSB1820_BAD_TEMP;
+static int64_t last_fed_time = 0;  // 0 = never fed
 static float last_temp_reading = DSB1820_BAD_TEMP;
 static int64_t last_temp_change_time = 0;
-static int64_t invalid_reading_start_time = 0;
 
 // Configurable temperature thresholds (loaded from NVS or defaults)
 static float temp_control_on_threshold = TEMP_CONTROL_ON_THRESHOLD;
@@ -52,58 +53,65 @@ static int16_t zb_temperature_to_s16(float temp)
     return (int16_t)(temp * 100);
 }
 
-static void check_temp_watchdog(float current_temp)
+// Feed watchdog - just record temp and time, no decisions
+static void feed_watchdog(float temp)
+{
+    if (temp == DSB1820_BAD_TEMP) {
+        return;
+    }
+    last_fed_temp = temp;
+    last_fed_time = esp_timer_get_time();
+}
+
+// Watchdog timer callback - does all the decision logic
+static void watchdog_timer_callback(void *arg)
 {
     int64_t now = esp_timer_get_time();
 
-    // Handle invalid readings
-    if (current_temp == DSB1820_BAD_TEMP) {
-        if (invalid_reading_start_time == 0) {
-            invalid_reading_start_time = now;
-            ESP_LOGW(TAG, "Temperature watchdog: invalid reading, starting timeout");
+    // Check if we've been fed recently with a valid temp
+    if (last_fed_time == 0 || last_fed_temp == DSB1820_BAD_TEMP) {
+        // Never fed or last feed was bad
+        int64_t elapsed;
+        if (last_fed_time == 0) {
+            elapsed = now;  // time since boot if never fed
         } else {
-            int64_t elapsed = now - invalid_reading_start_time;
-            if (elapsed >= TEMP_WATCHDOG_TIMEOUT_US) {
-                ESP_LOGW(TAG, "Temperature watchdog triggered! Sustained invalid readings for %d minutes - rebooting",
-                         TEMP_WATCHDOG_TIMEOUT_MINUTES);
-                esp_restart();
-            }
+            elapsed = now - last_fed_time;  // time since last (bad) feed
         }
-        return;
-    }
 
-    // Valid reading - clear invalid reading tracker
-    if (invalid_reading_start_time != 0) {
-        ESP_LOGI(TAG, "Temperature watchdog: valid reading restored");
-        invalid_reading_start_time = 0;
-    }
+        int elapsed_minutes = (int)(elapsed / 60000000);  // Convert microseconds to minutes
+        ESP_LOGW(TAG, "Watchdog: No valid temperature reading for %d minute(s) (timeout at %d minutes)",
+                 elapsed_minutes, TEMP_WATCHDOG_TIMEOUT_MINUTES);
 
-    // Initialize on first valid reading
-    if (last_temp_change_time == 0) {
-        last_temp_reading = current_temp;
-        last_temp_change_time = now;
-        ESP_LOGI(TAG, "Temperature watchdog initialized: %.2f°C", current_temp);
-        return;
-    }
-
-    // Check if temperature has changed
-    float temp_diff = current_temp - last_temp_reading;
-    if (temp_diff < 0) temp_diff = -temp_diff;  // abs value
-
-    if (temp_diff >= TEMP_CHANGE_THRESHOLD) {
-        // Temperature changed - reset watchdog
-        last_temp_reading = current_temp;
-        last_temp_change_time = now;
-        ESP_LOGD(TAG, "Temperature watchdog reset: %.2f°C (changed by %.2f°C)",
-                 current_temp, temp_diff);
-    } else {
-        // Temperature unchanged - check timeout
-        int64_t elapsed = now - last_temp_change_time;
         if (elapsed >= TEMP_WATCHDOG_TIMEOUT_US) {
-            ESP_LOGW(TAG, "Temperature watchdog triggered! Temperature stuck at %.2f°C for %d minutes - rebooting",
-                     current_temp, TEMP_WATCHDOG_TIMEOUT_MINUTES);
+            ESP_LOGW(TAG, "Watchdog: No valid readings for %d minutes - rebooting",
+                     TEMP_WATCHDOG_TIMEOUT_MINUTES);
             esp_restart();
         }
+        return;
+    }
+
+    // Have valid readings - check for stuck temperature
+    float temp_diff = last_fed_temp - last_temp_reading;
+    if (temp_diff < 0) temp_diff = -temp_diff;
+
+    if (temp_diff >= TEMP_CHANGE_THRESHOLD) {
+        // Temperature changed - update tracking
+        last_temp_reading = last_fed_temp;
+        last_temp_change_time = now;
+        ESP_LOGD(TAG, "Watchdog: temp changed to %.2f°C", last_fed_temp);
+    } else if (last_temp_change_time != 0) {
+        // Check for stuck value
+        int64_t elapsed = now - last_temp_change_time;
+        if (elapsed >= TEMP_WATCHDOG_TIMEOUT_US) {
+            ESP_LOGW(TAG, "Watchdog: Temperature stuck at %.2f°C for %d minutes - rebooting",
+                     last_fed_temp, TEMP_WATCHDOG_TIMEOUT_MINUTES);
+            esp_restart();
+        }
+    } else {
+        // First valid reading - start tracking
+        last_temp_reading = last_fed_temp;
+        last_temp_change_time = now;
+        ESP_LOGI(TAG, "Watchdog initialized: %.2f°C", last_fed_temp);
     }
 }
 
@@ -415,6 +423,15 @@ static void start_temp_timer()
     esp_timer_handle_t periodic_timer;
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, ESP_TEMP_SENSOR_UPDATE_INTERVAL));
+
+    // Watchdog timer - runs every minute to check for stuck/missing sensor readings
+    const esp_timer_create_args_t watchdog_timer_args = {
+        .callback = &watchdog_timer_callback,
+        .name = "watchdog_timer"};
+
+    esp_timer_handle_t watchdog_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&watchdog_timer_args, &watchdog_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(watchdog_timer, 60 * 1000000));  // 1 minute
 }
 
 
@@ -556,8 +573,8 @@ static void temp_timer_callback(void *arg)
         {
             ESP_LOGI(TAG, "temperature read from DS18B20[%d], for EP: %d,  %.2fC", dsb_index, i, temp_results[dsb_index]);
 
-            // Check temperature watchdog for stuck sensor
-            check_temp_watchdog(temp_results[dsb_index]);
+            // Feed watchdog with current reading
+            feed_watchdog(temp_results[dsb_index]);
 
             // Control switch based on temperature (including failsafe for bad readings)
             control_switch_by_temperature(temp_results[dsb_index], (HA_ESP_TEMP_START_ENDPOINT + i));

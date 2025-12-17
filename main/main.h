@@ -21,7 +21,7 @@
 #define TEMP_CONTROL_OFF_THRESHOLD      (3.0)   /* Turn OFF when temperature rises above this */
 
 /* Temperature watchdog - reboot if temperature hasn't changed for this duration */
-#define TEMP_WATCHDOG_TIMEOUT_MINUTES   30
+#define TEMP_WATCHDOG_TIMEOUT_MINUTES   15
 #define TEMP_WATCHDOG_TIMEOUT_US        (TEMP_WATCHDOG_TIMEOUT_MINUTES * 60 * 1000000LL)
 #define TEMP_CHANGE_THRESHOLD           0.01f   /* Minimum change to reset watchdog */
 
