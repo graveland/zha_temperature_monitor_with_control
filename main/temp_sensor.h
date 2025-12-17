@@ -16,9 +16,10 @@ typedef struct ds18b20_device_t
     ds18b20_resolution_t resolution;
 } ds18b20_device_t;
 
-void find_onewire(ds18b20_device_handle_t *ds18b20s, uint8_t *ds18b20_device_num)
+// Returns true if bus error occurred, false if search completed normally
+bool find_onewire(ds18b20_device_handle_t *ds18b20s, uint8_t *ds18b20_device_num)
 {
-
+    bool bus_error = false;
     onewire_bus_handle_t bus = NULL;
 
     onewire_bus_config_t bus_config = {
@@ -38,13 +39,15 @@ void find_onewire(ds18b20_device_handle_t *ds18b20s, uint8_t *ds18b20_device_num
     // create 1-wire device iterator, which is used for device search
     ESP_ERROR_CHECK(onewire_new_device_iter(bus, &iter));
     ESP_LOGI(TTAG, "Device iterator created, start searching...");
+    uint8_t consecutive_errors = 0;
+    const uint8_t max_consecutive_errors = 3;
     do
     {
         search_result = onewire_device_iter_get_next(iter, &next_onewire_device);
         if (search_result == ESP_OK)
-        { // found a new device, let's check if we can upgrade it to a DS18B20
+        {
+            consecutive_errors = 0;
             ds18b20_config_t ds_cfg = {};
-            // check if the device is a DS18B20, if so, return the ds18b20 handle
             if (ds18b20_new_device(&next_onewire_device, &ds_cfg, &ds18b20s[*ds18b20_device_num]) == ESP_OK)
             {
                 ESP_LOGI(TTAG, "Found a DS18B20[%d], address: %016llX", *ds18b20_device_num, next_onewire_device.address);
@@ -55,7 +58,18 @@ void find_onewire(ds18b20_device_handle_t *ds18b20s, uint8_t *ds18b20_device_num
                 ESP_LOGI(TTAG, "Found an unknown device, address: %016llX", next_onewire_device.address);
             }
         }
+        else if (search_result != ESP_ERR_NOT_FOUND)
+        {
+            consecutive_errors++;
+            if (consecutive_errors >= max_consecutive_errors)
+            {
+                ESP_LOGW(TTAG, "OneWire bus error after %d attempts, aborting search", consecutive_errors);
+                bus_error = true;
+                break;
+            }
+        }
     } while (search_result != ESP_ERR_NOT_FOUND);
     ESP_ERROR_CHECK(onewire_del_device_iter(iter));
     ESP_LOGI(TTAG, "Searching done, %d DS18B20 device(s) found", *ds18b20_device_num);
+    return bus_error;
 }

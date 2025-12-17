@@ -600,9 +600,14 @@ static esp_err_t deferred_driver_init(void)
 
     memset(ep_to_ds, 0xff, HA_ESP_NUM_T_SENSORS);
 
-    find_onewire(ds18b20s, &ds18b20_device_num);
+    bool onewire_bus_error = find_onewire(ds18b20s, &ds18b20_device_num);
     // We have an array of all found ds18b20s
     ESP_LOGI(TAG, "One Wire Count: %i", ds18b20_device_num);
+
+    if (onewire_bus_error) {
+        ESP_LOGE(TAG, "OneWire bus error - setting LED to RED");
+        set_led_color(255, 0, 0);
+    }
 
     uint8_t associated_eps_count = 0;
     // uint8_t unassociated_sensor_count = 0;
