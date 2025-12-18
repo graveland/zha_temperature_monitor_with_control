@@ -39,6 +39,10 @@ static int64_t last_fed_time = 0;  // 0 = never fed
 static float last_temp_reading = DSB1820_BAD_TEMP;
 static int64_t last_temp_change_time = 0;
 
+// Network watchdog - detect and recover from network disconnection
+static bool network_joined = false;
+static int network_not_joined_count = 0;
+
 // Configurable temperature thresholds (loaded from NVS or defaults)
 static float temp_control_on_threshold = TEMP_CONTROL_ON_THRESHOLD;
 static float temp_control_off_threshold = TEMP_CONTROL_OFF_THRESHOLD;
@@ -112,6 +116,19 @@ static void watchdog_timer_callback(void *arg)
         last_temp_reading = last_fed_temp;
         last_temp_change_time = now;
         ESP_LOGI(TAG, "Watchdog initialized: %.2f°C", last_fed_temp);
+    }
+
+    // Network watchdog - reboot if not joined for too long
+    if (network_joined) {
+        network_not_joined_count = 0;
+    } else {
+        network_not_joined_count++;
+        ESP_LOGW(TAG, "Watchdog: Not joined to network (count: %d)", network_not_joined_count);
+        if (network_not_joined_count > 5) {
+            ESP_LOGW(TAG, "Watchdog: Not joined to network for 5+ minutes - factory reset and reboot");
+            esp_zb_factory_reset();
+            esp_restart();
+        }
     }
 }
 
@@ -786,6 +803,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             }
             else
             {
+                network_joined = true;
                 ESP_LOGI(TAG, "Device rebooted");
             }
         }
@@ -798,6 +816,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK)
         {
+            network_joined = true;
             esp_zb_ieee_addr_t extended_pan_id;
             esp_zb_get_extended_pan_id(extended_pan_id);
             ESP_LOGI(TAG, "Joined network successfully (Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, Channel:%d, Short Address: 0x%04hx)",
@@ -817,6 +836,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
+        break;
+    case ESP_ZB_ZDO_SIGNAL_LEAVE:
+        network_joined = false;
+        ESP_LOGW(TAG, "Left network - will factory reset and reboot on next watchdog");
         break;
     default:
         ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type,

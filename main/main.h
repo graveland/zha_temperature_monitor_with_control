@@ -43,7 +43,7 @@
 /* OTA Upgrade configuration */
 #define OTA_UPGRADE_MANUFACTURER        0x1234                  /* Manufacturer code (must match OTA image) */
 #define OTA_UPGRADE_IMAGE_TYPE          0x5678                  /* Image type (must match OTA image) */
-#define OTA_UPGRADE_FILE_VERSION        0x00000008              /* Current firmware version */
+#define OTA_UPGRADE_FILE_VERSION        0x00000009              /* Current firmware version */
 #define OTA_UPGRADE_HW_VERSION          0x0001                  /* Hardware version */
 #define OTA_UPGRADE_MAX_DATA_SIZE       64                      /* OTA image block size */
 
