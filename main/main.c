@@ -29,9 +29,11 @@ uint8_t ep_to_ds[HA_ESP_NUM_T_SENSORS]; // Use 0xff to indicate no link
 
 // Forward declarations
 static void led_identify_blink(uint16_t identify_time);
+static void query_bound_switch_state(void);
 
 // Track the current state of the controlled switch
 static bool switch_state = false;
+static bool startup_temp_received = false;  // Block switch ops until first valid temp
 
 // Temperature watchdog - detect stuck/missing sensor readings
 static float last_fed_temp = DSB1820_BAD_TEMP;
@@ -431,6 +433,11 @@ static void led_identify_blink(uint16_t identify_time) {
     set_led_color(0, 0, 0);
 }
 
+static void switch_sync_timer_callback(void *arg)
+{
+    query_bound_switch_state();
+}
+
 static void start_temp_timer()
 {
     const esp_timer_create_args_t periodic_timer_args = {
@@ -449,6 +456,18 @@ static void start_temp_timer()
     esp_timer_handle_t watchdog_timer;
     ESP_ERROR_CHECK(esp_timer_create(&watchdog_timer_args, &watchdog_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(watchdog_timer, 60 * 1000000));  // 1 minute
+
+    // Switch state sync timer - runs every 5 minutes to verify/correct bound switch state
+    const esp_timer_create_args_t switch_sync_timer_args = {
+        .callback = &switch_sync_timer_callback,
+        .name = "switch_sync_timer"};
+
+    esp_timer_handle_t switch_sync_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&switch_sync_timer_args, &switch_sync_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(switch_sync_timer, 5 * 60 * 1000000));  // 5 minutes
+
+    // Query switch state immediately on startup
+    query_bound_switch_state();
 }
 
 
@@ -499,10 +518,87 @@ void send_on_off_command(uint8_t endpoint, bool on)
     }
 }
 
+static void query_bound_switch_state(void)
+{
+    if (!startup_temp_received) {
+        ESP_LOGD(TAG, "Skipping switch state query - no valid temp reading yet");
+        return;
+    }
+
+    uint16_t attr_id = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+    esp_zb_zcl_read_attr_cmd_t cmd_req = {
+        .zcl_basic_cmd.src_endpoint = HA_ESP_TEMP_START_ENDPOINT,
+        .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        .attr_number = 1,
+        .attr_field = &attr_id,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_read_attr_cmd_req(&cmd_req);
+    esp_zb_lock_release();
+    ESP_LOGI(TAG, "Querying bound switch state");
+}
+
+static esp_err_t zb_read_attr_resp_handler(esp_zb_zcl_cmd_read_attr_resp_message_t *message)
+{
+    if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Read attr response status: 0x%x", message->info.status);
+        return ESP_OK;
+    }
+
+    if (message->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+        return ESP_OK;
+    }
+
+    esp_zb_zcl_read_attr_resp_variable_t *var = message->variables;
+    while (var) {
+        if (var->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
+            var->status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+
+            bool actual_switch_state = *(bool *)var->attribute.data.value;
+            ESP_LOGI(TAG, "Bound switch actual state: %s", actual_switch_state ? "ON" : "OFF");
+
+            bool desired_state;
+            if (last_fed_temp == DSB1820_BAD_TEMP) {
+                desired_state = true;
+            } else if (last_fed_temp < temp_control_on_threshold) {
+                desired_state = true;
+            } else if (last_fed_temp >= temp_control_off_threshold) {
+                desired_state = false;
+            } else {
+                desired_state = actual_switch_state;
+            }
+
+            if (actual_switch_state != desired_state) {
+                ESP_LOGI(TAG, "Correcting switch state: %s -> %s (temp=%.2f)",
+                         actual_switch_state ? "ON" : "OFF",
+                         desired_state ? "ON" : "OFF",
+                         last_fed_temp);
+                send_on_off_command(HA_ESP_TEMP_START_ENDPOINT, desired_state);
+            }
+            switch_state = actual_switch_state;
+        }
+        var = var->next;
+    }
+    return ESP_OK;
+}
+
 void control_switch_by_temperature(float temperature, uint8_t endpoint)
 {
     bool should_change_state = false;
     bool new_state = switch_state;
+
+    // Set startup flag on first valid temperature reading
+    if (temperature != DSB1820_BAD_TEMP && !startup_temp_received) {
+        startup_temp_received = true;
+        ESP_LOGI(TAG, "First valid temperature reading: %.2f°C - switch operations enabled", temperature);
+    }
+
+    // Block all switch operations until we have a valid temperature
+    if (!startup_temp_received) {
+        return;
+    }
 
     // Failsafe: If temperature reading is invalid, turn switch ON
     if (temperature == DSB1820_BAD_TEMP) {
@@ -766,6 +862,9 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
         break;
     case ESP_ZB_CORE_CMD_GREEN_POWER_RECV_CB_ID:
         // Green power cluster - not used, ignore silently
+        break;
+    case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
+        ret = zb_read_attr_resp_handler((esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
         break;
     default:
         ESP_LOGW(TAG, "Unhandled action callback: %d (0x%04x)", callback_id, callback_id);
