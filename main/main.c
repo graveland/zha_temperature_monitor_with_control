@@ -396,7 +396,7 @@ static void init_rgb_led(void) {
     led_strip_config_t strip_config = {
         .strip_gpio_num = RGB_LED_GPIO,
         .max_leds = 1, // Single RGB LED
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
         .led_model = LED_MODEL_WS2812,
         .flags.invert_out = false,
     };
@@ -479,10 +479,10 @@ static void start_temp_timer()
 void report_temp_attr(uint8_t ep)
 {
     // Report temperature via Thermostat cluster's local_temperature attribute
-    esp_zb_zcl_report_attr_cmd_t report_attr_cmd;
+    esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
     report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
     report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID;
-    report_attr_cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
     report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
     report_attr_cmd.zcl_basic_cmd.src_endpoint = ep;
 
@@ -1196,7 +1196,7 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
 
-    esp_zb_main_loop_iteration();
+    esp_zb_stack_main_loop();
 }
 
 void app_main(void)
