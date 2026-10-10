@@ -32,7 +32,7 @@ const definition = {
             .withSetpoint('occupied_cooling_setpoint', -20, 80, 0.5)
             .withLocalTemperature(),
         // Reboot switch on endpoint 10
-        e.switch_().withEndpoint('reboot'),
+        e.switch_().withState('state', true).withEndpoint('reboot'),
         // Reset count from diagnostics cluster
         e.numeric('reset_count', ea.STATE).withDescription('Number of device resets'),
     ],
