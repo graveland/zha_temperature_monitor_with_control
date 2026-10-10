@@ -25,6 +25,9 @@
 #define TEMP_WATCHDOG_TIMEOUT_US        (TEMP_WATCHDOG_TIMEOUT_MINUTES * 60 * 1000000LL)
 #define TEMP_CHANGE_THRESHOLD           0.01f   /* Minimum change to reset watchdog */
 
+/* ZCL Temperature Measurement MeasuredValue "unknown" marker */
+#define ZB_TEMP_MEASUREMENT_UNKNOWN     ((int16_t)0x8000)
+
 /* Reboot switch endpoint */
 #define HA_ESP_REBOOT_ENDPOINT          10      /* Separate endpoint for reboot switch */
 

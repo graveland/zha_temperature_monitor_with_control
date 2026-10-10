@@ -45,6 +45,10 @@ static int64_t last_temp_change_time = 0;
 static bool network_joined = false;
 static int network_not_joined_count = 0;
 
+// Latest ambient reading received from a bound Temperature Measurement server
+static float remote_temp = DSB1820_BAD_TEMP;
+static int64_t remote_temp_time = 0;  // 0 = never received
+
 // Configurable temperature thresholds (loaded from NVS or defaults)
 static float temp_control_on_threshold = TEMP_CONTROL_ON_THRESHOLD;
 static float temp_control_off_threshold = TEMP_CONTROL_OFF_THRESHOLD;
@@ -540,6 +544,36 @@ static void query_bound_switch_state(void)
     ESP_LOGI(TAG, "Querying bound switch state");
 }
 
+static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *message)
+{
+    if (message->cluster != ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT ||
+        message->attribute.id != ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
+        ESP_LOGD(TAG, "Ignoring report: cluster=0x%x attr=0x%x", message->cluster, message->attribute.id);
+        return ESP_OK;
+    }
+
+    if (message->status != ESP_ZB_ZCL_STATUS_SUCCESS ||
+        message->attribute.data.type != ESP_ZB_ZCL_ATTR_TYPE_S16 ||
+        message->attribute.data.value == NULL) {
+        ESP_LOGW(TAG, "Bad temperature report from 0x%04x ep %d: status=0x%x type=0x%x",
+                 message->src_address.u.short_addr, message->src_endpoint,
+                 message->status, message->attribute.data.type);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int16_t raw = *(int16_t *)message->attribute.data.value;
+    if (raw == ZB_TEMP_MEASUREMENT_UNKNOWN) {
+        ESP_LOGW(TAG, "Remote sensor 0x%04x reports unknown temperature", message->src_address.u.short_addr);
+        return ESP_OK;
+    }
+
+    remote_temp = raw / 100.0f;
+    remote_temp_time = esp_timer_get_time();
+    ESP_LOGI(TAG, "Remote temperature report from 0x%04x ep %d: %.2f°C (local %.2f°C)",
+             message->src_address.u.short_addr, message->src_endpoint, remote_temp, last_fed_temp);
+    return ESP_OK;
+}
+
 static esp_err_t zb_read_attr_resp_handler(esp_zb_zcl_cmd_read_attr_resp_message_t *message)
 {
     if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
@@ -863,6 +897,9 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
     case ESP_ZB_CORE_CMD_GREEN_POWER_RECV_CB_ID:
         // Green power cluster - not used, ignore silently
         break;
+    case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
+        ret = zb_report_attr_handler((esp_zb_zcl_report_attr_message_t *)message);
+        break;
     case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
         ret = zb_read_attr_resp_handler((esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
         break;
@@ -985,8 +1022,16 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
     esp_zb_attribute_list_t *thermostat_cluster = esp_zb_thermostat_cluster_create(&thermostat_cfg);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_thermostat_cluster(cluster_list, thermostat_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-    // Note: We use Thermostat cluster's local_temperature for temperature reporting
-    // instead of a separate Temperature Measurement cluster
+    // Note: We use Thermostat cluster's local_temperature for our own temperature reporting.
+    // The Temperature Measurement cluster is client-only: it receives reports from a bound
+    // external sensor.
+    esp_zb_temperature_meas_cluster_cfg_t temp_meas_cfg = {
+        .measured_value = ZB_TEMP_MEASUREMENT_UNKNOWN,
+        .min_value = ZB_TEMP_MEASUREMENT_UNKNOWN,
+        .max_value = ZB_TEMP_MEASUREMENT_UNKNOWN,
+    };
+    esp_zb_attribute_list_t *temp_meas_cluster = esp_zb_temperature_meas_cluster_create(&temp_meas_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_temperature_meas_cluster(cluster_list, temp_meas_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
 
     // Add Power Configuration cluster to report mains power
     esp_zb_power_config_cluster_cfg_t power_cfg = {
