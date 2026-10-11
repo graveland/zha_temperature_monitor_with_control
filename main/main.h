@@ -28,6 +28,10 @@
 /* ZCL Temperature Measurement MeasuredValue "unknown" marker */
 #define ZB_TEMP_MEASUREMENT_UNKNOWN     ((int16_t)0x8000)
 
+/* Manufacturer-specific diagnostics cluster counting how remote temperature reports reach this device */
+#define ZB_DIAG_CLUSTER_ID              0xFC11
+#define ZB_ZCL_CMD_REPORT_ATTRIBUTES    0x0A
+
 /* Reboot switch endpoint */
 #define HA_ESP_REBOOT_ENDPOINT          10      /* Separate endpoint for reboot switch */
 

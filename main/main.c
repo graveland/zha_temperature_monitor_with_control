@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "zboss_api.h"
 
 #include "driver/gpio.h"
 #include "led_strip.h"
@@ -58,6 +59,23 @@ static int16_t zb_on_threshold_attr = 0;
 static int16_t zb_off_threshold_attr = 0;
 static int16_t zb_remote_temp_attr = ZB_TEMP_MEASUREMENT_UNKNOWN;
 static uint16_t zb_reset_count = 0;
+
+// Diagnostics cluster attributes, attribute id = index. Stored as plain counters the stack reads when reporting.
+static uint16_t diag_raw_total = 0;         // ZCL frames handed to the raw handler
+static uint16_t diag_raw_reports = 0;       // Report Attributes frames for Temperature Measurement
+static uint16_t diag_raw_report_src = 0;    // short address of the sender of the last such frame
+static uint16_t diag_report_cb = 0;         // report callbacks delivered to the application, any cluster
+static uint16_t diag_report_cb_status = 0;  // status of the last report callback
+static uint16_t diag_report_stored = 0;     // reports accepted and mirrored as outdoor temperature
+static uint16_t diag_other_cb = 0;          // action callbacks with no handler
+static uint16_t diag_other_cb_id = 0;       // id of the last such callback
+
+static uint16_t *const diag_values[] = {
+    &diag_raw_total, &diag_raw_reports, &diag_raw_report_src, &diag_report_cb,
+    &diag_report_cb_status, &diag_report_stored, &diag_other_cb, &diag_other_cb_id,
+};
+#define DIAG_COUNT (sizeof(diag_values) / sizeof(diag_values[0]))
+static uint16_t diag_reported[DIAG_COUNT];
 
 static int16_t zb_temperature_to_s16(float temp)
 {
@@ -477,13 +495,13 @@ static void start_temp_timer()
 
 
 
-static void report_thermostat_attr(uint8_t ep, uint16_t attribute_id)
+static void report_attr(uint8_t ep, uint16_t cluster_id, uint16_t attribute_id)
 {
     esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
     report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
     report_attr_cmd.attributeID = attribute_id;
     report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
-    report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
+    report_attr_cmd.clusterID = cluster_id;
     report_attr_cmd.zcl_basic_cmd.src_endpoint = ep;
 
     esp_zb_lock_acquire(portMAX_DELAY);
@@ -494,7 +512,17 @@ static void report_thermostat_attr(uint8_t ep, uint16_t attribute_id)
 
 void report_temp_attr(uint8_t ep)
 {
-    report_thermostat_attr(ep, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
+    report_attr(ep, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
+}
+
+static void report_changed_diag_attrs(void)
+{
+    for (uint16_t id = 0; id < DIAG_COUNT; id++) {
+        if (*diag_values[id] != diag_reported[id]) {
+            diag_reported[id] = *diag_values[id];
+            report_attr(HA_ESP_TEMP_START_ENDPOINT, ZB_DIAG_CLUSTER_ID, id);
+        }
+    }
 }
 
 void esp_app_temp_sensor_handler(float temperature, uint8_t endpoint)
@@ -551,6 +579,9 @@ static void query_bound_switch_state(void)
 
 static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *message)
 {
+    diag_report_cb++;
+    diag_report_cb_status = message->status;
+
     if (message->cluster != ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT ||
         message->attribute.id != ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
         ESP_LOGD(TAG, "Ignoring report: cluster=0x%x attr=0x%x", message->cluster, message->attribute.id);
@@ -583,7 +614,8 @@ static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *
                                  ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID, &zb_remote_temp_attr, false);
     esp_zb_lock_release();
-    report_thermostat_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
+    report_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
+    diag_report_stored++;
     return ESP_OK;
 }
 
@@ -746,6 +778,8 @@ static void temp_timer_callback(void *arg)
             }
         }
     }
+
+    report_changed_diag_attrs();
 }
 
 
@@ -886,6 +920,21 @@ static esp_err_t deferred_driver_init(void)
     return ESP_OK;
 }
 
+// Counts every ZCL frame before the stack dispatches it, so a report that arrives but never reaches
+// zb_report_attr_handler() still shows up in the diagnostics. Returns false so normal processing continues.
+static bool zb_raw_command_handler(uint8_t bufid)
+{
+    zb_zcl_parsed_hdr_t *hdr = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
+
+    diag_raw_total++;
+    if (hdr->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT && hdr->is_common_command &&
+        hdr->cmd_id == ZB_ZCL_CMD_REPORT_ATTRIBUTES) {
+        diag_raw_reports++;
+        diag_raw_report_src = hdr->addr_data.common_data.source.u.short_addr;
+    }
+    return false;
+}
+
 static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
 {
     esp_err_t ret = ESP_OK;
@@ -917,6 +966,8 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
         ret = zb_read_attr_resp_handler((esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
         break;
     default:
+        diag_other_cb++;
+        diag_other_cb_id = callback_id;
         ESP_LOGW(TAG, "Unhandled action callback: %d (0x%04x)", callback_id, callback_id);
         break;
     }
@@ -1050,6 +1101,15 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
     };
     esp_zb_attribute_list_t *temp_meas_cluster = esp_zb_temperature_meas_cluster_create(&temp_meas_cfg);
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_temperature_meas_cluster(cluster_list, temp_meas_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
+
+    esp_zb_attribute_list_t *diag_attrs = esp_zb_zcl_attr_list_create(ZB_DIAG_CLUSTER_ID);
+    for (uint16_t id = 0; id < DIAG_COUNT; id++) {
+        diag_reported[id] = 0xFFFF;
+        ESP_ERROR_CHECK(esp_zb_cluster_add_attr(diag_attrs, ZB_DIAG_CLUSTER_ID, id, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                                ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                                diag_values[id]));
+    }
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(cluster_list, diag_attrs, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     // Add Power Configuration cluster to report mains power
     esp_zb_power_config_cluster_cfg_t power_cfg = {
@@ -1185,6 +1245,7 @@ static void esp_zb_task(void *pvParameters)
 
     // Register OTA upgrade action handler
     esp_zb_core_action_handler_register(esp_zb_action_handler);
+    esp_zb_raw_command_handler_register(zb_raw_command_handler);
 
     esp_zb_device_register(ep_list);
     for (uint8_t ep = HA_ESP_TEMP_START_ENDPOINT;

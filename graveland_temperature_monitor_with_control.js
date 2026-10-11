@@ -1,4 +1,4 @@
-const {identify} = require('zigbee-herdsman-converters/lib/modernExtend');
+const {identify, deviceAddCustomCluster, numeric} = require('zigbee-herdsman-converters/lib/modernExtend');
 const exposes = require('zigbee-herdsman-converters/lib/exposes');
 const fz = require('zigbee-herdsman-converters/converters/fromZigbee');
 const tz = require('zigbee-herdsman-converters/converters/toZigbee');
@@ -17,6 +17,19 @@ const fzLocal = {
     },
 };
 
+// Counters from the firmware's diagnostics cluster, attribute id = index. They show how reports from a bound
+// temperature sensor reach this device: raw frame seen -> callback delivered -> report stored.
+const diagAttributes = [
+    ['rawTotal', 'diag_raw_total', 'ZCL frames the stack passed to the raw handler'],
+    ['rawReports', 'diag_raw_reports', 'Temperature Measurement report frames received'],
+    ['rawReportSrc', 'diag_raw_report_src', 'Short address of the sender of the last temperature report frame'],
+    ['reportCb', 'diag_report_cb', 'Report callbacks delivered to the application, any cluster'],
+    ['reportCbStatus', 'diag_report_cb_status', 'Status of the last report callback'],
+    ['reportStored', 'diag_report_stored', 'Reports accepted and mirrored as outdoor temperature'],
+    ['otherCb', 'diag_other_cb', 'Action callbacks with no handler'],
+    ['otherCbId', 'diag_other_cb_id', 'Id of the last unhandled action callback'],
+];
+
 const definition = {
     zigbeeModel: ['Temperature Monitor'],
     model: 'Temperature Monitor',
@@ -24,6 +37,19 @@ const definition = {
     description: 'Temperature monitor with freeze protection switch control (mains powered)',
     extend: [
         identify(),
+        deviceAddCustomCluster('graveland_diag', {
+            ID: 0xFC11,
+            attributes: Object.fromEntries(diagAttributes.map(([attribute], id) => [attribute, {ID: id, type: 0x21}])),
+            commands: {},
+            commandsResponse: {},
+        }),
+        ...diagAttributes.map(([attribute, name, description]) => numeric({
+            name,
+            cluster: 'graveland_diag',
+            attribute,
+            description,
+            access: 'STATE_GET',
+        })),
     ],
     exposes: [
         // Use Thermostat cluster for temperature and setpoints
@@ -32,7 +58,7 @@ const definition = {
             .withSetpoint('occupied_cooling_setpoint', -20, 80, 0.5)
             .withLocalTemperature(),
         // Temperature reported by a sensor bound to this device, mirrored from its Temperature Measurement reports
-        e.numeric('outdoor_temperature', ea.STATE).withUnit('°C').withDescription('Temperature reported by a bound sensor'),
+        e.numeric('outdoor_temperature', ea.STATE_GET).withUnit('°C').withDescription('Temperature reported by a bound sensor'),
         // Reboot switch on endpoint 10
         e.switch_().withState('state', true).withEndpoint('reboot'),
         // Reset count from diagnostics cluster
@@ -46,6 +72,7 @@ const definition = {
     toZigbee: [
         tz.thermostat_occupied_heating_setpoint,
         tz.thermostat_occupied_cooling_setpoint,
+        tz.thermostat_outdoor_temperature,
         tz.on_off,
     ],
     endpoint: (device) => {
