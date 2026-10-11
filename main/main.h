@@ -32,6 +32,9 @@
 #define ZB_DIAG_CLUSTER_ID              0xFC11
 #define ZB_ZCL_CMD_REPORT_ATTRIBUTES    0x0A
 
+/* Stack of the task running the Zigbee stack, where its callbacks execute */
+#define ZB_TASK_STACK_SIZE              6144
+
 /* Reboot switch endpoint */
 #define HA_ESP_REBOOT_ENDPOINT          10      /* Separate endpoint for reboot switch */
 

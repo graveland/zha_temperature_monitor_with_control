@@ -4,6 +4,7 @@
 #include "string.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
@@ -60,7 +61,8 @@ static int16_t zb_off_threshold_attr = 0;
 static int16_t zb_remote_temp_attr = ZB_TEMP_MEASUREMENT_UNKNOWN;
 static uint16_t zb_reset_count = 0;
 
-// Diagnostics cluster attributes, attribute id = index. Stored as plain counters the stack reads when reporting.
+// Diagnostics cluster attributes, attribute id = index. The stack keeps its own copy of each value, so
+// diag_publish() writes them in; the counters here are plain variables.
 static uint16_t diag_raw_total = 0;         // ZCL frames handed to the raw handler
 static uint16_t diag_raw_reports = 0;       // Report Attributes frames for Temperature Measurement
 static uint16_t diag_raw_report_src = 0;    // short address of the sender of the last such frame
@@ -69,13 +71,54 @@ static uint16_t diag_report_cb_status = 0;  // status of the last report callbac
 static uint16_t diag_report_stored = 0;     // reports accepted and mirrored as outdoor temperature
 static uint16_t diag_other_cb = 0;          // action callbacks with no handler
 static uint16_t diag_other_cb_id = 0;       // id of the last such callback
+static uint16_t diag_reset_reason = 0;      // esp_reset_reason() of this boot
+static uint16_t diag_crumb_zb_prev = 0;     // last Zigbee callback breadcrumb before the previous reset
+static uint16_t diag_crumb_timer_prev = 0;  // last esp_timer callback breadcrumb before the previous reset
+static uint16_t diag_min_free_heap_kb = 0;  // lowest free heap since boot
+static uint16_t diag_stack_free_zb = 0;     // lowest free bytes of the Zigbee task stack
+static uint16_t diag_stack_free_timer = 0;  // lowest free bytes of the esp_timer task stack
 
 static uint16_t *const diag_values[] = {
     &diag_raw_total, &diag_raw_reports, &diag_raw_report_src, &diag_report_cb,
     &diag_report_cb_status, &diag_report_stored, &diag_other_cb, &diag_other_cb_id,
+    &diag_reset_reason, &diag_crumb_zb_prev, &diag_crumb_timer_prev,
+    &diag_min_free_heap_kb, &diag_stack_free_zb, &diag_stack_free_timer,
 };
 #define DIAG_COUNT (sizeof(diag_values) / sizeof(diag_values[0]))
-static uint16_t diag_reported[DIAG_COUNT];
+
+static TaskHandle_t zb_task_handle;
+
+// Breadcrumbs: the last step each context reached, in memory that survives a software, watchdog or panic
+// reset, so the next boot can report where the previous run stopped.
+#define CRUMB_MAGIC 0xC0FFEE15
+static RTC_NOINIT_ATTR uint32_t rtc_crumb_magic;
+static RTC_NOINIT_ATTR uint16_t rtc_crumb_zb;
+static RTC_NOINIT_ATTR uint16_t rtc_crumb_timer;
+
+enum {
+    CRUMB_ZB_RAW = 1,           // raw command handler
+    CRUMB_ZB_REPORT_IN,         // report callback entered
+    CRUMB_ZB_REPORT_OK,         // report validated
+    CRUMB_ZB_SET_ATTR,          // writing the outdoor temperature attribute
+    CRUMB_ZB_REPORT_OUT,        // sending the outdoor temperature report
+    CRUMB_ZB_REPORT_DONE,       // report callback finished
+    CRUMB_ZB_READ_RESP,         // read attribute response handler
+    CRUMB_ZB_SET_CB,            // attribute write handler
+    CRUMB_ZB_OTHER_CB,          // unhandled action callback
+    CRUMB_ZB_SIGNAL,            // app signal handler
+};
+enum {
+    CRUMB_TIMER_TEMP = 20,      // temperature timer entered
+    CRUMB_TIMER_READ,           // sensors read
+    CRUMB_TIMER_CONTROL,        // switch control
+    CRUMB_TIMER_REPORT,         // reporting the local temperature
+    CRUMB_TIMER_DIAG,           // publishing diagnostics
+    CRUMB_TIMER_DONE,           // temperature timer finished
+    CRUMB_TIMER_WATCHDOG = 30,  // watchdog timer entered
+    CRUMB_TIMER_SYNC = 40,      // switch sync timer entered
+};
+#define CRUMB_ZB(step) (rtc_crumb_zb = (step))
+#define CRUMB_TIMER(step) (rtc_crumb_timer = (step))
 
 static int16_t zb_temperature_to_s16(float temp)
 {
@@ -95,6 +138,7 @@ static void feed_watchdog(float temp)
 // Watchdog timer callback - does all the decision logic
 static void watchdog_timer_callback(void *arg)
 {
+    CRUMB_TIMER(CRUMB_TIMER_WATCHDOG);
     int64_t now = esp_timer_get_time();
 
     // Check if we've been fed recently with a valid temp
@@ -159,6 +203,7 @@ static void watchdog_timer_callback(void *arg)
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
+    CRUMB_ZB(CRUMB_ZB_SET_CB);
     esp_err_t ret = ESP_OK;
 
     ESP_LOGI(TAG, "Cluster attr write: cluster=0x%x, attr=0x%x",
@@ -458,6 +503,7 @@ static void led_identify_blink(uint16_t identify_time) {
 
 static void switch_sync_timer_callback(void *arg)
 {
+    CRUMB_TIMER(CRUMB_TIMER_SYNC);
     query_bound_switch_state();
 }
 
@@ -515,14 +561,23 @@ void report_temp_attr(uint8_t ep)
     report_attr(ep, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
 }
 
-static void report_changed_diag_attrs(void)
+static void diag_publish(void)
 {
-    for (uint16_t id = 0; id < DIAG_COUNT; id++) {
-        if (*diag_values[id] != diag_reported[id]) {
-            diag_reported[id] = *diag_values[id];
-            report_attr(HA_ESP_TEMP_START_ENDPOINT, ZB_DIAG_CLUSTER_ID, id);
-        }
+    diag_min_free_heap_kb = esp_get_minimum_free_heap_size() / 1024;
+    if (zb_task_handle) {
+        diag_stack_free_zb = uxTaskGetStackHighWaterMark(zb_task_handle);
     }
+    TaskHandle_t timer_task = xTaskGetHandle("esp_timer");
+    if (timer_task) {
+        diag_stack_free_timer = uxTaskGetStackHighWaterMark(timer_task);
+    }
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    for (uint16_t id = 0; id < DIAG_COUNT; id++) {
+        esp_zb_zcl_set_attribute_val(HA_ESP_TEMP_START_ENDPOINT, ZB_DIAG_CLUSTER_ID,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, id, diag_values[id], false);
+    }
+    esp_zb_lock_release();
 }
 
 void esp_app_temp_sensor_handler(float temperature, uint8_t endpoint)
@@ -579,6 +634,7 @@ static void query_bound_switch_state(void)
 
 static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *message)
 {
+    CRUMB_ZB(CRUMB_ZB_REPORT_IN);
     diag_report_cb++;
     diag_report_cb_status = message->status;
 
@@ -603,24 +659,29 @@ static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *
         return ESP_OK;
     }
 
+    CRUMB_ZB(CRUMB_ZB_REPORT_OK);
     remote_temp = raw / 100.0f;
     remote_temp_time = esp_timer_get_time();
     ESP_LOGI(TAG, "Remote temperature report from 0x%04x ep %d: %.2f°C (local %.2f°C)",
              message->src_address.u.short_addr, message->src_endpoint, remote_temp, last_fed_temp);
 
+    CRUMB_ZB(CRUMB_ZB_SET_ATTR);
     zb_remote_temp_attr = raw;
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_set_attribute_val(HA_ESP_TEMP_START_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID, &zb_remote_temp_attr, false);
     esp_zb_lock_release();
+    CRUMB_ZB(CRUMB_ZB_REPORT_OUT);
     report_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
     diag_report_stored++;
+    CRUMB_ZB(CRUMB_ZB_REPORT_DONE);
     return ESP_OK;
 }
 
 static esp_err_t zb_read_attr_resp_handler(esp_zb_zcl_cmd_read_attr_resp_message_t *message)
 {
+    CRUMB_ZB(CRUMB_ZB_READ_RESP);
     if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "Read attr response status: 0x%x", message->info.status);
         return ESP_OK;
@@ -750,7 +811,9 @@ static void temp_timer_callback(void *arg)
 {
     // ESP_LOGI(TAG, "Temperature timer called, time since boot: %lld us", time_since_boot);
     float temp_results[HA_ESP_NUM_T_SENSORS] = {DSB1820_BAD_TEMP};
+    CRUMB_TIMER(CRUMB_TIMER_TEMP);
     read_temps(temp_results);
+    CRUMB_TIMER(CRUMB_TIMER_READ);
 
     for (int i = 0; i < HA_ESP_NUM_T_SENSORS; i++)
     {
@@ -769,17 +832,21 @@ static void temp_timer_callback(void *arg)
             feed_watchdog(temp_results[dsb_index]);
 
             // Control switch based on temperature (including failsafe for bad readings)
+            CRUMB_TIMER(CRUMB_TIMER_CONTROL);
             control_switch_by_temperature(temp_results[dsb_index], (HA_ESP_TEMP_START_ENDPOINT + i));
 
             if (temp_results[dsb_index] != DSB1820_BAD_TEMP)
             {
+                CRUMB_TIMER(CRUMB_TIMER_REPORT);
                 esp_app_temp_sensor_handler(temp_results[dsb_index], (HA_ESP_TEMP_START_ENDPOINT + i));
                 report_temp_attr(HA_ESP_TEMP_START_ENDPOINT + i);
             }
         }
     }
 
-    report_changed_diag_attrs();
+    CRUMB_TIMER(CRUMB_TIMER_DIAG);
+    diag_publish();
+    CRUMB_TIMER(CRUMB_TIMER_DONE);
 }
 
 
@@ -926,6 +993,7 @@ static bool zb_raw_command_handler(uint8_t bufid)
 {
     zb_zcl_parsed_hdr_t *hdr = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
 
+    CRUMB_ZB(CRUMB_ZB_RAW);
     diag_raw_total++;
     if (hdr->cluster_id == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT && hdr->is_common_command &&
         hdr->cmd_id == ZB_ZCL_CMD_REPORT_ATTRIBUTES) {
@@ -966,6 +1034,7 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
         ret = zb_read_attr_resp_handler((esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
         break;
     default:
+        CRUMB_ZB(CRUMB_ZB_OTHER_CB);
         diag_other_cb++;
         diag_other_cb_id = callback_id;
         ESP_LOGW(TAG, "Unhandled action callback: %d (0x%04x)", callback_id, callback_id);
@@ -981,6 +1050,7 @@ static esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
+    CRUMB_ZB(CRUMB_ZB_SIGNAL);
     uint32_t *p_sg_p = signal_struct->p_app_signal;
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
@@ -1104,7 +1174,6 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
 
     esp_zb_attribute_list_t *diag_attrs = esp_zb_zcl_attr_list_create(ZB_DIAG_CLUSTER_ID);
     for (uint16_t id = 0; id < DIAG_COUNT; id++) {
-        diag_reported[id] = 0xFFFF;
         ESP_ERROR_CHECK(esp_zb_cluster_add_attr(diag_attrs, ZB_DIAG_CLUSTER_ID, id, ESP_ZB_ZCL_ATTR_TYPE_U16,
                                                 ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
                                                 diag_values[id]));
@@ -1280,6 +1349,18 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
+    esp_reset_reason_t reason = esp_reset_reason();
+    diag_reset_reason = reason;
+    if (rtc_crumb_magic == CRUMB_MAGIC && reason != ESP_RST_POWERON) {
+        diag_crumb_zb_prev = rtc_crumb_zb;
+        diag_crumb_timer_prev = rtc_crumb_timer;
+    }
+    rtc_crumb_magic = CRUMB_MAGIC;
+    rtc_crumb_zb = 0;
+    rtc_crumb_timer = 0;
+    ESP_LOGW(TAG, "Boot, reset reason %d, previous breadcrumbs zb=%u timer=%u",
+             reason, diag_crumb_zb_prev, diag_crumb_timer_prev);
+
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
@@ -1291,5 +1372,5 @@ void app_main(void)
     zb_reset_count = increment_and_get_reset_count();
 
     /* Start Zigbee stack task */
-    xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+    xTaskCreate(esp_zb_task, "Zigbee_main", ZB_TASK_STACK_SIZE, NULL, 5, &zb_task_handle);
 }
