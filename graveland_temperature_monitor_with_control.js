@@ -31,6 +31,8 @@ const definition = {
             .withSetpoint('occupied_heating_setpoint', -20, 80, 0.5)
             .withSetpoint('occupied_cooling_setpoint', -20, 80, 0.5)
             .withLocalTemperature(),
+        // Temperature reported by a sensor bound to this device, mirrored from its Temperature Measurement reports
+        e.numeric('outdoor_temperature', ea.STATE).withUnit('°C').withDescription('Temperature reported by a bound sensor'),
         // Reboot switch on endpoint 10
         e.switch_().withState('state', true).withEndpoint('reboot'),
         // Reset count from diagnostics cluster

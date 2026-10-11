@@ -56,6 +56,7 @@ static float temp_control_off_threshold = TEMP_CONTROL_OFF_THRESHOLD;
 // Zigbee attribute values (must be static/global for ESP Zigbee stack)
 static int16_t zb_on_threshold_attr = 0;
 static int16_t zb_off_threshold_attr = 0;
+static int16_t zb_remote_temp_attr = ZB_TEMP_MEASUREMENT_UNKNOWN;
 static uint16_t zb_reset_count = 0;
 
 static int16_t zb_temperature_to_s16(float temp)
@@ -476,12 +477,11 @@ static void start_temp_timer()
 
 
 
-void report_temp_attr(uint8_t ep)
+static void report_thermostat_attr(uint8_t ep, uint16_t attribute_id)
 {
-    // Report temperature via Thermostat cluster's local_temperature attribute
     esp_zb_zcl_report_attr_cmd_t report_attr_cmd = {0};
     report_attr_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
-    report_attr_cmd.attributeID = ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID;
+    report_attr_cmd.attributeID = attribute_id;
     report_attr_cmd.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
     report_attr_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT;
     report_attr_cmd.zcl_basic_cmd.src_endpoint = ep;
@@ -490,6 +490,11 @@ void report_temp_attr(uint8_t ep)
     esp_zb_zcl_report_attr_cmd_req(&report_attr_cmd);
     esp_zb_lock_release();
     ESP_EARLY_LOGD(TAG, "Send 'report attributes' command");
+}
+
+void report_temp_attr(uint8_t ep)
+{
+    report_thermostat_attr(ep, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
 }
 
 void esp_app_temp_sensor_handler(float temperature, uint8_t endpoint)
@@ -571,6 +576,14 @@ static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *
     remote_temp_time = esp_timer_get_time();
     ESP_LOGI(TAG, "Remote temperature report from 0x%04x ep %d: %.2f°C (local %.2f°C)",
              message->src_address.u.short_addr, message->src_endpoint, remote_temp, last_fed_temp);
+
+    zb_remote_temp_attr = raw;
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(HA_ESP_TEMP_START_ENDPOINT,
+                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID, &zb_remote_temp_attr, false);
+    esp_zb_lock_release();
+    report_thermostat_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
     return ESP_OK;
 }
 
@@ -1020,6 +1033,11 @@ static esp_zb_cluster_list_t *custom_temperature_sensor_clusters_create(void)
         .system_mode = 0x04,  // Heat mode
     };
     esp_zb_attribute_list_t *thermostat_cluster = esp_zb_thermostat_cluster_create(&thermostat_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(thermostat_cluster, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+                                            ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID,
+                                            ESP_ZB_ZCL_ATTR_TYPE_S16,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
+                                            &zb_remote_temp_attr));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_thermostat_cluster(cluster_list, thermostat_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     // Note: We use Thermostat cluster's local_temperature for our own temperature reporting.
