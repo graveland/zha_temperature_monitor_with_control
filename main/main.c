@@ -77,12 +77,13 @@ static uint16_t diag_crumb_timer_prev = 0;  // last esp_timer callback breadcrum
 static uint16_t diag_min_free_heap_kb = 0;  // lowest free heap since boot
 static uint16_t diag_stack_free_zb = 0;     // lowest free bytes of the Zigbee task stack
 static uint16_t diag_stack_free_timer = 0;  // lowest free bytes of the esp_timer task stack
+static uint16_t diag_restart_cause_prev = 0;  // why the previous run called esp_restart(), 0 if it did not
 
 static uint16_t *const diag_values[] = {
     &diag_raw_total, &diag_raw_reports, &diag_raw_report_src, &diag_report_cb,
     &diag_report_cb_status, &diag_report_stored, &diag_other_cb, &diag_other_cb_id,
     &diag_reset_reason, &diag_crumb_zb_prev, &diag_crumb_timer_prev,
-    &diag_min_free_heap_kb, &diag_stack_free_zb, &diag_stack_free_timer,
+    &diag_min_free_heap_kb, &diag_stack_free_zb, &diag_stack_free_timer, &diag_restart_cause_prev,
 };
 #define DIAG_COUNT (sizeof(diag_values) / sizeof(diag_values[0]))
 
@@ -94,31 +95,57 @@ static TaskHandle_t zb_task_handle;
 static RTC_NOINIT_ATTR uint32_t rtc_crumb_magic;
 static RTC_NOINIT_ATTR uint16_t rtc_crumb_zb;
 static RTC_NOINIT_ATTR uint16_t rtc_crumb_timer;
+static RTC_NOINIT_ATTR uint16_t rtc_restart_cause;
 
 enum {
     CRUMB_ZB_RAW = 1,           // raw command handler
-    CRUMB_ZB_REPORT_IN,         // report callback entered
-    CRUMB_ZB_REPORT_OK,         // report validated
-    CRUMB_ZB_SET_ATTR,          // writing the outdoor temperature attribute
-    CRUMB_ZB_REPORT_OUT,        // sending the outdoor temperature report
-    CRUMB_ZB_REPORT_DONE,       // report callback finished
-    CRUMB_ZB_READ_RESP,         // read attribute response handler
-    CRUMB_ZB_SET_CB,            // attribute write handler
-    CRUMB_ZB_OTHER_CB,          // unhandled action callback
-    CRUMB_ZB_SIGNAL,            // app signal handler
+    CRUMB_ZB_REPORT_IN = 2,     // report callback entered
+    CRUMB_ZB_REPORT_OK = 3,     // report validated
+    CRUMB_ZB_REPORT_STORED = 4, // received value stored for the timer to publish
+    CRUMB_ZB_REPORT_DONE = 5,   // report callback finished
+    CRUMB_ZB_READ_RESP = 7,     // read attribute response handler
+    CRUMB_ZB_SET_CB = 8,        // attribute write handler
+    CRUMB_ZB_OTHER_CB = 9,      // unhandled action callback
+    CRUMB_ZB_SIGNAL = 10,       // app signal handler
 };
 enum {
     CRUMB_TIMER_TEMP = 20,      // temperature timer entered
-    CRUMB_TIMER_READ,           // sensors read
-    CRUMB_TIMER_CONTROL,        // switch control
-    CRUMB_TIMER_REPORT,         // reporting the local temperature
-    CRUMB_TIMER_DIAG,           // publishing diagnostics
-    CRUMB_TIMER_DONE,           // temperature timer finished
+    CRUMB_TIMER_READ = 21,      // sensors read
+    CRUMB_TIMER_CONTROL = 22,   // switch control
+    CRUMB_TIMER_REPORT = 23,    // reporting the local temperature
+    CRUMB_TIMER_DIAG = 24,      // publishing diagnostics
+    CRUMB_TIMER_DONE = 25,      // temperature timer finished
+    CRUMB_TIMER_REMOTE = 26,    // publishing the received outdoor temperature
     CRUMB_TIMER_WATCHDOG = 30,  // watchdog timer entered
     CRUMB_TIMER_SYNC = 40,      // switch sync timer entered
 };
+enum {
+    RESTART_NO_READINGS = 1,    // watchdog: no valid temperature reading
+    RESTART_STUCK_TEMP = 2,     // watchdog: temperature stuck
+    RESTART_NOT_JOINED = 3,     // watchdog: not joined to the network
+    RESTART_REBOOT_SWITCH = 4,  // On written to the reboot switch endpoint
+    RESTART_OTA_DONE = 5,       // OTA image applied
+    RESTART_OTHER = 99,         // esp_restart() from code that does not label it
+};
 #define CRUMB_ZB(step) (rtc_crumb_zb = (step))
 #define CRUMB_TIMER(step) (rtc_crumb_timer = (step))
+
+// Remember why the firmware restarts itself, so the next boot can report it
+static void restart_for(uint16_t cause)
+{
+    rtc_restart_cause = cause;
+    esp_restart();
+}
+
+static void restart_shutdown_handler(void)
+{
+    if (rtc_restart_cause == 0) {
+        rtc_restart_cause = RESTART_OTHER;
+    }
+}
+
+// A received temperature waits here for the timer to publish it, so no ZCL send happens inside the report callback
+static volatile bool remote_temp_pending = false;
 
 static int16_t zb_temperature_to_s16(float temp)
 {
@@ -158,7 +185,7 @@ static void watchdog_timer_callback(void *arg)
         if (elapsed >= TEMP_WATCHDOG_TIMEOUT_US) {
             ESP_LOGW(TAG, "Watchdog: No valid readings for %d minutes - rebooting",
                      TEMP_WATCHDOG_TIMEOUT_MINUTES);
-            esp_restart();
+            restart_for(RESTART_NO_READINGS);
         }
         return;
     }
@@ -178,7 +205,7 @@ static void watchdog_timer_callback(void *arg)
         if (elapsed >= TEMP_WATCHDOG_TIMEOUT_US) {
             ESP_LOGW(TAG, "Watchdog: Temperature stuck at %.2f°C for %d minutes - rebooting",
                      last_fed_temp, TEMP_WATCHDOG_TIMEOUT_MINUTES);
-            esp_restart();
+            restart_for(RESTART_STUCK_TEMP);
         }
     } else {
         // First valid reading - start tracking
@@ -196,7 +223,7 @@ static void watchdog_timer_callback(void *arg)
         if (network_not_joined_count > 5) {
             ESP_LOGW(TAG, "Watchdog: Not joined to network for 5+ minutes - factory reset and reboot");
             esp_zb_factory_reset();
-            esp_restart();
+            restart_for(RESTART_NOT_JOINED);
         }
     }
 }
@@ -281,7 +308,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 ESP_LOGW(TAG, "Reboot switch triggered - rebooting device");
                 // Short delay to allow Zigbee response to be sent
                 vTaskDelay(pdMS_TO_TICKS(500));
-                esp_restart();
+                restart_for(RESTART_REBOOT_SWITCH);
             }
         }
     }
@@ -429,7 +456,7 @@ static esp_err_t zb_ota_upgrade_status_handler(esp_zb_zcl_ota_upgrade_value_mess
                 return ret;
             }
             ESP_LOGW(TAG, "Prepare to restart system");
-            esp_restart();
+            restart_for(RESTART_OTA_DONE);
             break;
 
         default:
@@ -561,6 +588,21 @@ void report_temp_attr(uint8_t ep)
     report_attr(ep, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID);
 }
 
+static void publish_remote_temp(void)
+{
+    if (!remote_temp_pending) {
+        return;
+    }
+    remote_temp_pending = false;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(HA_ESP_TEMP_START_ENDPOINT,
+                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID, &zb_remote_temp_attr, false);
+    esp_zb_lock_release();
+    report_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
+}
+
 static void diag_publish(void)
 {
     diag_min_free_heap_kb = esp_get_minimum_free_heap_size() / 1024;
@@ -665,15 +707,9 @@ static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *
     ESP_LOGI(TAG, "Remote temperature report from 0x%04x ep %d: %.2f°C (local %.2f°C)",
              message->src_address.u.short_addr, message->src_endpoint, remote_temp, last_fed_temp);
 
-    CRUMB_ZB(CRUMB_ZB_SET_ATTR);
     zb_remote_temp_attr = raw;
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_set_attribute_val(HA_ESP_TEMP_START_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID, &zb_remote_temp_attr, false);
-    esp_zb_lock_release();
-    CRUMB_ZB(CRUMB_ZB_REPORT_OUT);
-    report_attr(HA_ESP_TEMP_START_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT, ESP_ZB_ZCL_ATTR_THERMOSTAT_OUTDOOR_TEMPERATURE_ID);
+    remote_temp_pending = true;
+    CRUMB_ZB(CRUMB_ZB_REPORT_STORED);
     diag_report_stored++;
     CRUMB_ZB(CRUMB_ZB_REPORT_DONE);
     return ESP_OK;
@@ -844,6 +880,8 @@ static void temp_timer_callback(void *arg)
         }
     }
 
+    CRUMB_TIMER(CRUMB_TIMER_REMOTE);
+    publish_remote_temp();
     CRUMB_TIMER(CRUMB_TIMER_DIAG);
     diag_publish();
     CRUMB_TIMER(CRUMB_TIMER_DONE);
@@ -1354,12 +1392,15 @@ void app_main(void)
     if (rtc_crumb_magic == CRUMB_MAGIC && reason != ESP_RST_POWERON) {
         diag_crumb_zb_prev = rtc_crumb_zb;
         diag_crumb_timer_prev = rtc_crumb_timer;
+        diag_restart_cause_prev = rtc_restart_cause;
     }
     rtc_crumb_magic = CRUMB_MAGIC;
     rtc_crumb_zb = 0;
     rtc_crumb_timer = 0;
-    ESP_LOGW(TAG, "Boot, reset reason %d, previous breadcrumbs zb=%u timer=%u",
-             reason, diag_crumb_zb_prev, diag_crumb_timer_prev);
+    rtc_restart_cause = 0;
+    ESP_ERROR_CHECK(esp_register_shutdown_handler(restart_shutdown_handler));
+    ESP_LOGW(TAG, "Boot, reset reason %d, previous breadcrumbs zb=%u timer=%u restart cause=%u",
+             reason, diag_crumb_zb_prev, diag_crumb_timer_prev, diag_restart_cause_prev);
 
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),

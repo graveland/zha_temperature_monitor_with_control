@@ -29,11 +29,12 @@ const diagAttributes = [
     ['otherCb', 'diag_other_cb', 'Action callbacks with no handler'],
     ['otherCbId', 'diag_other_cb_id', 'Id of the last unhandled action callback'],
     ['resetReason', 'diag_reset_reason', 'Reset reason of this boot (1 power on, 3 software, 4 panic, 5 interrupt watchdog, 6 task watchdog, 7 other watchdog, 9 brownout)'],
-    ['crumbZbPrev', 'diag_crumb_zb_prev', 'Last Zigbee callback step before the previous reset (2 report in, 3 validated, 4 set attribute, 5 report out, 6 done, 1 raw, 7 read response, 8 write, 9 other, 10 signal)'],
-    ['crumbTimerPrev', 'diag_crumb_timer_prev', 'Last esp_timer step before the previous reset (20 temperature timer, 21 sensors read, 22 control, 23 report, 24 diagnostics, 25 done, 30 watchdog, 40 switch sync)'],
+    ['crumbZbPrev', 'diag_crumb_zb_prev', 'Last Zigbee callback step before the previous reset (1 raw frame, 2 report in, 3 validated, 4 stored, 5 done, 7 read response, 8 write, 9 other, 10 signal)'],
+    ['crumbTimerPrev', 'diag_crumb_timer_prev', 'Last esp_timer step before the previous reset (20 temperature timer, 21 sensors read, 22 control, 23 report, 24 diagnostics, 25 done, 26 remote temperature, 30 watchdog, 40 switch sync)'],
     ['minFreeHeapKb', 'diag_min_free_heap_kb', 'Lowest free heap since boot (KB)'],
     ['stackFreeZb', 'diag_stack_free_zb', 'Lowest free bytes of the Zigbee task stack'],
     ['stackFreeTimer', 'diag_stack_free_timer', 'Lowest free bytes of the esp_timer task stack'],
+    ['restartCausePrev', 'diag_restart_cause_prev', 'Why the previous run called esp_restart(), 0 if it did not (1 no readings, 2 stuck temperature, 3 not joined, 4 reboot switch, 5 OTA done, 99 other)'],
 ];
 
 const definition = {
