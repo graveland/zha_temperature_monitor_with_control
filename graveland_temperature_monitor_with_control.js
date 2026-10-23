@@ -15,6 +15,19 @@ const fzLocal = {
             }
         },
     },
+    rejoin_count: {
+        cluster: 'haDiagnostic',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            // Manufacturer-specific 0xC001; zigbee-herdsman may key unknown
+            // attributes by hex string or by decimal value.
+            for (const key of ['0xc001', '0xC001', '49153']) {
+                if (msg.data[key] !== undefined) {
+                    return {rejoin_count: msg.data[key]};
+                }
+            }
+        },
+    },
 };
 
 // Counters from the firmware's diagnostics cluster, attribute id = index. They show how reports from a bound
@@ -71,11 +84,18 @@ const definition = {
         e.switch_().withState('state', true).withEndpoint('reboot'),
         // Reset count from diagnostics cluster
         e.numeric('reset_count', ea.STATE).withDescription('Number of device resets'),
+        e
+            .switch_()
+            .withState('state', true)
+            .withEndpoint('rejoin')
+            .withDescription('Leave the network and re-steer (send TOGGLE)'),
+        e.numeric('rejoin_count', ea.STATE).withDescription('Number of forced re-joins'),
     ],
     fromZigbee: [
         fz.thermostat,
         fz.on_off,
         fzLocal.reset_count,
+        fzLocal.rejoin_count,
     ],
     toZigbee: [
         tz.thermostat_occupied_heating_setpoint,
@@ -84,7 +104,7 @@ const definition = {
         tz.on_off,
     ],
     endpoint: (device) => {
-        return {reboot: 10};
+        return {reboot: 10, rejoin: 11};
     },
     ota: true,
     meta: {

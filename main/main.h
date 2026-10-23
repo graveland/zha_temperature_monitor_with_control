@@ -47,6 +47,8 @@
 
 /* Reboot switch endpoint */
 #define HA_ESP_REBOOT_ENDPOINT          10      /* Separate endpoint for reboot switch */
+#define HA_ESP_REJOIN_ENDPOINT 11 /* separate endpoint for the rejoin switch */
+#define REJOIN_MIN_INTERVAL_MS (5 * 60 * 1000) /* ignore further rejoin requests for 5 min */
 
 /* We use the Thermostat cluster for temperature thresholds:
  * - occupied_heating_setpoint (0x0012) = ON threshold (turn heater ON below this)
