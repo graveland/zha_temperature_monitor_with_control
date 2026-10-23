@@ -17,8 +17,8 @@
 #define RGB_LED_GPIO 8 /* GPIO pin for RGB LED */
 
 /* Temperature control thresholds with hysteresis */
-#define TEMP_CONTROL_ON_THRESHOLD       (2.0)   /* Turn ON when temperature drops below this */
-#define TEMP_CONTROL_OFF_THRESHOLD      (3.0)   /* Turn OFF when temperature rises above this */
+#define TEMP_CONTROL_ON_THRESHOLD       (5.0)   /* Turn ON when temperature drops below this */
+#define TEMP_CONTROL_OFF_THRESHOLD      (7.0)   /* Turn OFF when temperature rises above this */
 
 /* Temperature watchdog - reboot if temperature hasn't changed for this duration */
 #define TEMP_WATCHDOG_TIMEOUT_MINUTES   15
