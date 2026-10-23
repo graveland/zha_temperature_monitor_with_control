@@ -762,6 +762,33 @@ static esp_err_t zb_report_attr_handler(const esp_zb_zcl_report_attr_message_t *
     return ESP_OK;
 }
 
+// True while a received outdoor temperature that is not stale says it is too warm to need the heater.
+// The gate closes above OUTDOOR_HEATER_LOCKOUT_ABOVE_C and reopens at or below OUTDOOR_HEATER_ALLOW_AT_C,
+// keeping its state in between. A missing or stale reading opens it, so the heater never depends on a
+// silent sensor. The report handler writes the reading on the Zigbee task and this runs on the timer task
+// too, so a torn read of the 64-bit timestamp must fail safe: an impossible age counts as stale.
+static bool outdoor_blocks_heater(void)
+{
+    static bool locked_out = false;
+    bool was_locked_out = locked_out;
+
+    int64_t received = remote_temp_time;
+    int64_t age = esp_timer_get_time() - received;
+    if (received == 0 || age < 0 || age > OUTDOOR_TEMP_STALE_US) {
+        locked_out = false;
+    } else if (remote_temp > OUTDOOR_HEATER_LOCKOUT_ABOVE_C) {
+        locked_out = true;
+    } else if (remote_temp <= OUTDOOR_HEATER_ALLOW_AT_C) {
+        locked_out = false;
+    }
+
+    if (locked_out != was_locked_out) {
+        ESP_LOGI(TAG, "Outdoor temperature %.2f°C: heater %s", remote_temp,
+                 locked_out ? "kept off" : "allowed");
+    }
+    return locked_out;
+}
+
 static esp_err_t zb_read_attr_resp_handler(esp_zb_zcl_cmd_read_attr_resp_message_t *message)
 {
     CRUMB_ZB(CRUMB_ZB_READ_RESP);
@@ -783,7 +810,9 @@ static esp_err_t zb_read_attr_resp_handler(esp_zb_zcl_cmd_read_attr_resp_message
             ESP_LOGI(TAG, "Bound switch actual state: %s", actual_switch_state ? "ON" : "OFF");
 
             bool desired_state;
-            if (last_fed_temp == DSB1820_BAD_TEMP) {
+            if (outdoor_blocks_heater()) {
+                desired_state = false;
+            } else if (last_fed_temp == DSB1820_BAD_TEMP) {
                 desired_state = true;
             } else if (last_fed_temp < temp_control_on_threshold) {
                 desired_state = true;
@@ -823,8 +852,16 @@ void control_switch_by_temperature(float temperature, uint8_t endpoint)
         return;
     }
 
+    // A fresh warm outdoor temperature outranks everything below, the failsafe included
+    if (outdoor_blocks_heater()) {
+        if (switch_state) {
+            new_state = false;
+            should_change_state = true;
+            ESP_LOGI(TAG, "Outdoor temperature %.2f°C keeps the heater off - turning switch OFF", remote_temp);
+        }
+    }
     // Failsafe: If temperature reading is invalid, turn switch ON
-    if (temperature == DSB1820_BAD_TEMP) {
+    else if (temperature == DSB1820_BAD_TEMP) {
         if (!switch_state) {
             new_state = true;
             should_change_state = true;

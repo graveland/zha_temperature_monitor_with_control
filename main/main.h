@@ -20,6 +20,16 @@
 #define TEMP_CONTROL_ON_THRESHOLD       (5.0)   /* Turn ON when temperature drops below this */
 #define TEMP_CONTROL_OFF_THRESHOLD      (7.0)   /* Turn OFF when temperature rises above this */
 
+/* A fresh warm outdoor temperature keeps the heater off, whatever the local temperature says. The gate has
+ * hysteresis so an outdoor reading hovering near the limit cannot chatter the heater: it closes above
+ * LOCKOUT_ABOVE and opens again at or below ALLOW_AT, and keeps its state in between. The wider side is the
+ * one that allows heating, so the worst a late rise can do is heat a little longer. */
+#define OUTDOOR_HEATER_LOCKOUT_ABOVE_C  (0.8f)
+#define OUTDOOR_HEATER_ALLOW_AT_C       (0.5f)
+/* An outdoor temperature older than this is ignored, so a silent sensor can never keep the heater off */
+#define OUTDOOR_TEMP_STALE_MINUTES      30
+#define OUTDOOR_TEMP_STALE_US           (OUTDOOR_TEMP_STALE_MINUTES * 60 * 1000000LL)
+
 /* Temperature watchdog - reboot if temperature hasn't changed for this duration */
 #define TEMP_WATCHDOG_TIMEOUT_MINUTES   15
 #define TEMP_WATCHDOG_TIMEOUT_US        (TEMP_WATCHDOG_TIMEOUT_MINUTES * 60 * 1000000LL)
