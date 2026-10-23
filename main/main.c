@@ -950,21 +950,6 @@ static esp_err_t deferred_driver_init(void)
     ESP_LOGI(TAG, "Initializing RGB LED");
     init_rgb_led();
 
-    // Load temperature thresholds from NVS or use defaults
-    float loaded_on = 0, loaded_off = 0;
-    if (get_temp_thresholds(&loaded_on, &loaded_off) == ESP_OK)
-    {
-        temp_control_on_threshold = loaded_on;
-        temp_control_off_threshold = loaded_off;
-        ESP_LOGI(TAG, "Using stored thresholds: ON=%.2f°C, OFF=%.2f°C",
-                 temp_control_on_threshold, temp_control_off_threshold);
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Using default thresholds: ON=%.2f°C, OFF=%.2f°C",
-                 temp_control_on_threshold, temp_control_off_threshold);
-    }
-
     memset(ep_to_ds, 0xff, HA_ESP_NUM_T_SENSORS);
 
     bool onewire_bus_error = find_onewire(ds18b20s, &ds18b20_device_num);
@@ -1537,6 +1522,19 @@ void app_main(void)
 
     // Increment and store reset count before Zigbee starts
     zb_reset_count = increment_and_get_reset_count();
+
+    // Load the saved thresholds before the thermostat cluster is created, so the setpoint attributes
+    // Zigbee2MQTT reads start from the values actually in use
+    float loaded_on = 0, loaded_off = 0;
+    if (get_temp_thresholds(&loaded_on, &loaded_off) == ESP_OK) {
+        temp_control_on_threshold = loaded_on;
+        temp_control_off_threshold = loaded_off;
+        ESP_LOGI(TAG, "Using stored thresholds: ON=%.2f°C, OFF=%.2f°C",
+                 temp_control_on_threshold, temp_control_off_threshold);
+    } else {
+        ESP_LOGI(TAG, "Using default thresholds: ON=%.2f°C, OFF=%.2f°C",
+                 temp_control_on_threshold, temp_control_off_threshold);
+    }
 
     /* Start Zigbee stack task */
     xTaskCreate(esp_zb_task, "Zigbee_main", ZB_TASK_STACK_SIZE, NULL, 5, &zb_task_handle);
